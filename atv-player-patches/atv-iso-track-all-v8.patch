@@ -1,0 +1,708 @@
+diff --git a/src/atv_player/player/bluray_iso.py b/src/atv_player/player/bluray_iso.py
+index 32b4f79..eda6e37 100644
+--- a/src/atv_player/player/bluray_iso.py
++++ b/src/atv_player/player/bluray_iso.py
+@@ -53,6 +53,10 @@ class IsoPlaybackPlan:
+     stream: BluRayIsoStream
+     source: object | None = None
+     playlist_segments: tuple[IsoPlaybackSegment, ...] = ()
++    # .clpi ProgramInfo 里的流语言（(kind, lang) 列表，ProgramInfo 顺序），
++    # kind: "audio" | "subtitle"，lang: 3 字母 ISO 639-2/T 小写（如 "chi"/"eng"）。
++    # mpv 的 .m2ts 流不带语言时，PlayerWindow 用它给轨道补语言标签。
++    stream_languages: tuple[tuple[str, str], ...] = ()
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -62,6 +66,8 @@ class _MplsPlayItem:
+     in_time: int
+     out_time: int
+     duration: int
++    # .mpls STN 表里的流语言（(kind, lang) 列表，STN 顺序）；.clpi 没语言时兜底。
++    stn_languages: tuple[tuple[str, str], ...] = ()
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -81,6 +87,8 @@ class _ClpiEntryPoint:
+ class _ParsedClpi:
+     clip_id: str
+     entry_points: tuple[_ClpiEntryPoint, ...]
++    # .clpi ProgramInfo 里的流语言（(kind, lang) 列表，ProgramInfo 顺序）
++    stream_languages: tuple[tuple[str, str], ...] = ()
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -968,6 +976,82 @@ def _read_u32be(data: bytes, offset: int) -> int:
+     return int.from_bytes(data[offset : offset + 4], "big")
+ 
+ 
++def _parse_mpls_stream_entry(data: bytes, offset: int) -> tuple[int, str, int]:
++    """解析 .mpls STN 表里一条流，返回 (coding_type, lang, 下一条 offset)。
++
++    每条流 = len1(1) + [stream_type + pid…](len1) + len2(1) + [coding_type + 字段…](len2)。
++    语言：audio 在 coding_type 后 2 字节（format/rate 1 字节后）；PGS(0x90) 在后 1 字节；
++    Text(0x92) 在后 2 字节（char_code 1 字节后）。解析失败返回 (0, "", len(data))。
++    """
++    try:
++        if offset < 0 or offset + 2 > len(data):
++            return (0, "", len(data))
++        len1 = data[offset]
++        pos1 = offset + 1
++        next1 = pos1 + len1
++        if next1 + 2 > len(data):
++            return (0, "", len(data))
++        len2 = data[next1]
++        pos2 = next1 + 1
++        coding_type = data[pos2]
++        lang = ""
++        if coding_type in (
++            0x03, 0x04, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0xA1, 0xA2,
++        ):
++            if pos2 + 5 <= len(data):
++                lang = data[pos2 + 2 : pos2 + 5].decode("ascii", errors="ignore").strip().lower()
++        elif coding_type == 0x90:
++            if pos2 + 4 <= len(data):
++                lang = data[pos2 + 1 : pos2 + 4].decode("ascii", errors="ignore").strip().lower()
++        elif coding_type == 0x92:
++            if pos2 + 5 <= len(data):
++                lang = data[pos2 + 2 : pos2 + 5].decode("ascii", errors="ignore").strip().lower()
++        if len(lang) != 3 or not lang.isalpha():
++            lang = ""
++        next_offset = pos2 + len2
++        if next_offset <= offset:
++            next_offset = len(data)
++        return (coding_type, lang, next_offset)
++    except Exception:
++        return (0, "", len(data))
++
++
++def _parse_mpls_stn_languages(data: bytes, stn_start: int) -> tuple[tuple[str, str], ...]:
++    """解析 .mpls STN 表，返回 (kind, lang) 列表（STN 顺序：audio 在前，PG 在后）。
++
++    STN 表 = len(2) + reserved(2) + 8 个计数(8) + reserved(4) + 流条目
++    （video, audio, PG, IG, secondary_audio, secondary_video, pip_pg, dv 顺序）。
++    IG(0x91) 是菜单图形，不算字幕。解析失败返回 ()。
++    """
++    try:
++        if stn_start < 0 or stn_start + 16 > len(data):
++            return ()
++        counts = data[stn_start + 4 : stn_start + 12]
++        if len(counts) < 8:
++            return ()
++        num_video, num_audio, num_pg, num_ig, num_sec_audio, num_sec_video, num_pip_pg, num_dv = counts
++        offset = stn_start + 16
++        result: list[tuple[str, str]] = []
++        # 按 STN 顺序跳过各段：video(无语言) -> audio -> PG -> IG(跳过) -> 其余(跳过)。
++        for _ in range(num_video):
++            _, _, offset = _parse_mpls_stream_entry(data, offset)
++        for _ in range(num_audio):
++            coding_type, lang, offset = _parse_mpls_stream_entry(data, offset)
++            if lang:
++                kind = _clpi_coding_type_kind(coding_type)
++                if kind == "audio":
++                    result.append(("audio", lang))
++        for _ in range(num_pg):
++            coding_type, lang, offset = _parse_mpls_stream_entry(data, offset)
++            if lang and coding_type in (0x90, 0x92):
++                result.append(("subtitle", lang))
++        for _ in range(num_ig + num_sec_audio + num_sec_video + num_pip_pg + num_dv):
++            _, _, offset = _parse_mpls_stream_entry(data, offset)
++        return tuple(result)
++    except Exception:
++        return ()
++
++
+ def _parse_mpls_playlist(path: str, data: bytes) -> _ParsedMplsPlaylist:
+     if len(data) < 20 or data[:4] != b"MPLS":
+         raise ValueError("无效的 Blu-ray playlist")
+@@ -993,6 +1077,15 @@ def _parse_mpls_playlist(path: str, data: bytes) -> _ParsedMplsPlaylist:
+         out_time = _read_u32be(data, item_start + 16)
+         duration = max(0, out_time - in_time)
+         if clip_name and clip_codec == "M2TS":
++            # STN 表在 PlayItem 固定字段后：UO(8) + random_access(1) + still_mode(1) + still_time(2) = 32 字节；
++            # 多角度时再加 angle_count(1) + 标志(1) + 每多一个角度 10 字节(clip 5 + codec 4 + stc 1)。
++            stn_start = item_start + 32
++            if item_start + 11 <= len(data):
++                is_multi_angle = (data[item_start + 10] >> 4) & 1
++                if is_multi_angle and stn_start + 2 <= len(data):
++                    angle_count = data[stn_start]
++                    stn_start += 2 + max(0, angle_count - 1) * 10
++            stn_languages = _parse_mpls_stn_languages(data, stn_start)
+             play_items.append(
+                 _MplsPlayItem(
+                     clip_id=clip_name,
+@@ -1000,6 +1093,7 @@ def _parse_mpls_playlist(path: str, data: bytes) -> _ParsedMplsPlaylist:
+                     in_time=in_time,
+                     out_time=out_time,
+                     duration=duration,
++                    stn_languages=stn_languages,
+                 )
+             )
+             total_duration += duration
+@@ -1088,6 +1182,69 @@ def _parse_clpi_ep_map_entry_points(
+     return tuple(sorted(entry_points, key=lambda item: item.time_45k))
+ 
+ 
++def _clpi_coding_type_kind(coding_type: int) -> str | None:
++    """_clpi ProgramInfo coding_type -> "audio" / "subtitle" / None（video/菜单等无语言）。"""
++    if coding_type in (
++        0x03, 0x04,  # MPEG-1/2 Audio
++        0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,  # LPCM/AC-3/DTS/TrueHD/...
++        0xA1, 0xA2,  # E-AC-3 secondary / DTS Express
++    ):
++        return "audio"
++    if coding_type in (0x90, 0x92):  # PGS / Text subtitle
++        return "subtitle"
++    return None
++
++
++def _parse_clpi_program_languages(data: bytes) -> tuple[tuple[str, str], ...]:
++    """解析 .clpi ProgramInfo，返回 (kind, lang) 列表（ProgramInfo 顺序）。
++
++    按 libbluray clpi_parse.c（_parse_program / _parse_stream_attr）：
++    流条目 = pid(2) + len(1) + coding_type(1) + 字段 + isrc(12) + 填充，
++    len = 从 coding_type 到条目尾的字节数（含 isrc 与填充）。
++    语言码（3 字母 ISO 639-2/T）位置：
++      音频(0x03/0x04/0x80-0x86/0xa1/0xa2)：条目+5（coding_type 后 1 字节 format+rate）
++      PGS(0x90)：条目+4（coding_type 后直接是语言）
++      Text(0x92)：条目+5（coding_type 后 1 字节 char_code）
++    视频无语言。解析失败返回 ()（调用方按无语言处理，不报错）。
++    """
++    try:
++        if len(data) < 32 or data[:4] != b"HDMV":
++            return ()
++        program_info_start = _read_u32be(data, 12)
++        if program_info_start <= 0 or program_info_start + 6 > len(data):
++            return ()
++        program_count = data[program_info_start + 5]
++        cursor = program_info_start + 6
++        result: list[tuple[str, str]] = []
++        for _ in range(program_count):
++            if cursor + 8 > len(data):
++                break
++            # spn_program_sequence_start(4) + program_map_pid(2) + stream_count(1) + num_groups(1)
++            stream_count = data[cursor + 6]
++            cursor += 8
++            for _ in range(stream_count):
++                if cursor + 3 > len(data):
++                    break
++                attr_len = data[cursor + 2]  # len：1 字节
++                coding_type = data[cursor + 3]
++                if attr_len < 1 or cursor + 3 + attr_len > len(data):
++                    break
++                kind = _clpi_coding_type_kind(coding_type)
++                if kind is not None:
++                    # PGS(0x90) 语言在条目+4；音频/Text 在条目+5
++                    lang_off = cursor + 4 if coding_type == 0x90 else cursor + 5
++                    try:
++                        lang = data[lang_off : lang_off + 3].decode("ascii").strip().lower()
++                    except UnicodeDecodeError:
++                        lang = ""
++                    if len(lang) == 3 and lang.isalpha():
++                        result.append((kind, lang))
++                cursor += 3 + attr_len
++        return tuple(result)
++    except Exception:
++        return ()
++
++
+ def _parse_clpi_entry_points(clip_id: str, data: bytes) -> _ParsedClpi:
+     if len(data) < 20 or data[:4] != b"HDMV":
+         raise ValueError("无效的 Blu-ray clip info")
+@@ -1100,6 +1257,7 @@ def _parse_clpi_entry_points(clip_id: str, data: bytes) -> _ParsedClpi:
+     return _ParsedClpi(
+         clip_id=clip_id,
+         entry_points=entry_points,
++        stream_languages=_parse_clpi_program_languages(data),
+     )
+ 
+ 
+@@ -1208,10 +1366,22 @@ def _slice_cached_iso_stream_source(
+     return _CachedIsoStreamSource(size=length, segments=tuple(segments))
+ 
+ 
++def _read_iso_stream_languages(remote_iso: _RemoteUdfIso, stream_path: str) -> tuple[tuple[str, str], ...]:
++    """读某条 .m2ts 对应 .clpi 的 ProgramInfo 语言（失败返回 ()，不报错）。"""
++    try:
++        basename = stream_path.rsplit("/", 1)[-1]
++        clip_id = basename.rsplit(".", 1)[0] if "." in basename else basename
++        if not clip_id:
++            return ()
++        return _read_remote_udf_clipinfo(remote_iso, clip_id).stream_languages
++    except Exception:
++        return ()
++
++
+ def _build_trimmed_playlist_clip_source(
+     remote_iso: _RemoteUdfIso,
+     play_item: _MplsPlayItem,
+-) -> _CachedIsoStreamSource:
++) -> tuple[_CachedIsoStreamSource, tuple[tuple[str, str], ...]]:
+     clip_entry_ref = _find_remote_udf_entry(remote_iso, play_item.stream_path)
+     clip_source = _build_cached_iso_stream_source(remote_iso, clip_entry_ref)
+     parsed_clpi = _read_remote_udf_clipinfo(remote_iso, play_item.clip_id)
+@@ -1221,7 +1391,10 @@ def _build_trimmed_playlist_clip_source(
+         play_item.out_time,
+         clip_source.size,
+     )
+-    return _slice_cached_iso_stream_source(clip_source, start, end_exclusive - start)
++    return (
++        _slice_cached_iso_stream_source(clip_source, start, end_exclusive - start),
++        parsed_clpi.stream_languages,
++    )
+ 
+ 
+ def _trim_leading_intro_play_items(play_items: tuple[_MplsPlayItem, ...]) -> tuple[_MplsPlayItem, ...]:
+@@ -1362,10 +1535,33 @@ def _prepare_remote_udf_playlist_playback(remote_iso: _RemoteUdfIso) -> IsoPlayb
+     ):
+         selected_play_items = _trim_leading_intro_play_items(parsed.play_items)
+         try:
+-            child_sources = [
++            child_results = [
+                 _build_trimmed_playlist_clip_source(remote_iso, play_item)
+                 for play_item in selected_play_items
+             ]
++            child_sources = [result[0] for result in child_results]
++            # 语言取最大段（正片）clip 的 .clpi：首个 play item 可能是片头 logo/警告（无语言），
++            # 正片在后面。同一 playlist 内各 clip 流结构相同，取最大段最可能是正片。
++            playlist_languages = ()
++            if child_results:
++                largest = max(child_results, key=lambda r: getattr(r[0], "size", 0) or 0)
++                playlist_languages = largest[1] if largest[1] else ()
++                if not playlist_languages:
++                    # 最大段无语言时，退回首个有语言的 clip（避免全空）。
++                    for _, langs in child_results:
++                        if langs:
++                            playlist_languages = langs
++                            break
++            if not playlist_languages:
++                # .clpi 全无语言时，用 .mpls STN 表兜底（.mpls 在 prepare 时必读，无额外网络请求）。
++                # 取最大段 play item 的 STN 语言，仍为空时退回首个有 STN 语言的 play item。
++                largest_item = max(selected_play_items, key=lambda item: item.duration or 0)
++                playlist_languages = largest_item.stn_languages or ()
++                if not playlist_languages:
++                    for item in selected_play_items:
++                        if item.stn_languages:
++                            playlist_languages = item.stn_languages
++                            break
+         except ValueError:
+             continue
+         if _looks_like_repeated_trimmed_segment_loop(selected_play_items, child_sources):
+@@ -1389,6 +1585,7 @@ def _prepare_remote_udf_playlist_playback(remote_iso: _RemoteUdfIso) -> IsoPlayb
+             stream=BluRayIsoStream(path=selected_path, size=selected_source.size),
+             source=selected_source,
+             playlist_segments=playlist_segments,
++            stream_languages=playlist_languages,
+         )
+     return None
+ 
+@@ -1411,6 +1608,7 @@ def _prepare_promoted_pycdlib_udf_playback(reader: RemoteRangeReader, iso: Any)
+     return IsoPlaybackPlan(
+         stream=selected_stream,
+         source=_build_cached_iso_stream_source(remote_iso, entry_ref),
++        stream_languages=_read_iso_stream_languages(remote_iso, selected_stream.path),
+     )
+ 
+ 
+@@ -1433,6 +1631,7 @@ def prepare_iso_playback(
+             return IsoPlaybackPlan(
+                 stream=selected_stream,
+                 source=_build_cached_iso_stream_source(iso, entry_ref),
++                stream_languages=_read_iso_stream_languages(iso, selected_stream.path),
+             )
+         promoted_plan = _prepare_promoted_pycdlib_udf_playback(reader, iso)
+         if promoted_plan is not None:
+diff --git a/src/atv_player/player/m3u8_ad_filter.py b/src/atv_player/player/m3u8_ad_filter.py
+index ee91b23..770fd50 100644
+--- a/src/atv_player/player/m3u8_ad_filter.py
++++ b/src/atv_player/player/m3u8_ad_filter.py
+@@ -198,6 +198,21 @@ class M3U8AdFilter:
+         self._get = get
+         self._proxy_server = proxy_server or LocalHlsProxyServer(get=get)
+         self._bluray_iso_inspector = bluray_iso_inspector or BlurayIsoInspector()
++        # 最近一次 ISO prepare 的 .clpi 流语言（(kind, lang) 列表）；非 ISO 时为 ()。
++        # PlayerWindow 在主线程读它，传给 MpvWidget 给无语言的轨道补标签。
++        self._last_iso_stream_languages: tuple[tuple[str, str], ...] = ()
++        # ISO 代理 URL -> .clpi 流语言。多次 prepare（主 URL + 辅助 URL）会互相覆盖
++        # 共享的“上一次”状态，改按返回的代理 URL 键存，PlayerWindow 按本次 prepared_url 取。
++        self._iso_stream_languages_by_url: dict[str, tuple[tuple[str, str], ...]] = {}
++
++    @property
++    def last_iso_stream_languages(self) -> tuple[tuple[str, str], ...]:
++        """最近一次 ISO prepare 的 .clpi 流语言（非 ISO 时为 ()）。"""
++        return self._last_iso_stream_languages
++
++    def get_iso_stream_languages(self, prepared_url: str) -> tuple[tuple[str, str], ...]:
++        """取某次 prepare（按返回的代理 URL）的 ISO 流语言；没有返回 ()。"""
++        return self._iso_stream_languages_by_url.get(prepared_url, ())
+ 
+     def should_prepare(self, url: str) -> bool:
+         if parse_cenc_media_fragment(url) is not None:
+@@ -236,24 +251,36 @@ class M3U8AdFilter:
+             iso_stream_source: object | None = None
+             if callable(prepare_playback):
+                 playback_plan = prepare_playback(url, normalized_headers)
++                # .clpi 语言：mpv 的 .m2ts 流不带语言，留给 PlayerWindow 补标签
++                self._last_iso_stream_languages = tuple(
++                    getattr(playback_plan, "stream_languages", ()) or ()
++                )
+                 playlist_segments = tuple(getattr(playback_plan, "playlist_segments", ()) or ())
+                 if playlist_segments:
+-                    return self._proxy_server.create_iso_playlist_url(
++                    playlist_url = self._proxy_server.create_iso_playlist_url(
+                         url,
+                         headers=normalized_headers,
+                         segments=playlist_segments,
+                     )
++                    if self._last_iso_stream_languages:
++                        self._iso_stream_languages_by_url[playlist_url] = self._last_iso_stream_languages
++                    return playlist_url
+                 selected_stream = playback_plan.stream
+                 iso_stream_source = playback_plan.source
+             else:
++                # 非 ISO：不碰 _last_iso_stream_languages（辅助请求如音频/字幕是非 ISO，
++                # 若清成 () 会覆盖主 ISO 已取到的语言，导致 PlayerWindow 读到空）。
+                 selected_stream = self._bluray_iso_inspector.inspect(url, normalized_headers)
+-            return self._proxy_server.create_iso_media_url(
++            media_url = self._proxy_server.create_iso_media_url(
+                 url,
+                 headers=normalized_headers,
+                 stream_path=selected_stream.path,
+                 stream_size=selected_stream.size,
+                 iso_stream_source=iso_stream_source,
+             )
++            if self._last_iso_stream_languages:
++                self._iso_stream_languages_by_url[media_url] = self._last_iso_stream_languages
++            return media_url
+         if _is_dash_data_uri(url):
+             if dash_video_id:
+                 mpd_url = self._proxy_server.create_dash_url(
+diff --git a/src/atv_player/player/mpv_widget.py b/src/atv_player/player/mpv_widget.py
+index fddd85d..8a82553 100644
+--- a/src/atv_player/player/mpv_widget.py
++++ b/src/atv_player/player/mpv_widget.py
+@@ -398,6 +398,10 @@ class MpvWidget(QWidget):
+         # mpv_get_property 会等 demuxer 锁,曾把同步轮询的主线程冻住分钟级。
+         self._observed_properties: dict[str, object] = {}
+         self._observed_property_handlers: list[object] = []
++        # ISO（.clpi ProgramInfo）流语言（(kind, lang) 列表，ProgramInfo 顺序）；
++        # mpv 的 .m2ts 流不带语言时，subtitle/audio_tracks() 按同类型顺序用它补 lang。
++        # 仅存元组（无 Qt 调用），PlayerWindow 在主线程经 set_iso_track_languages 设置。
++        self._iso_track_languages: tuple[tuple[str, str], ...] = ()
+         self._audio_cover_active = False
+         self._audio_cover_mode = False
+         self._playback_finished_emitted = False
+@@ -2056,6 +2060,17 @@ class MpvWidget(QWidget):
+             int(bool(track.title)),
+         )
+ 
++    def set_iso_track_languages(self, languages: tuple[tuple[str, str], ...] | list[tuple[str, str]] | None) -> None:
++        """设置 ISO（.clpi）流语言；非 ISO 传 () 清空。仅存元组，无 Qt 调用。"""
++        self._iso_track_languages = tuple(languages or ())
++
++    def _iso_language_for_track(self, kind: str, index: int) -> str:
++        """取 .clpi 里第 index 条该类型流的语言（同类型顺序）；没有返回 ""。"""
++        langs = [lang for item_kind, lang in self._iso_track_languages if item_kind == kind]
++        if 0 <= index < len(langs):
++            return langs[index]
++        return ""
++
+     def subtitle_tracks(self) -> list[SubtitleTrack]:
+         if not self._on_widget_thread():
+             return list(self._run_on_widget_thread(self.subtitle_tracks) or [])
+@@ -2076,19 +2091,42 @@ class MpvWidget(QWidget):
+             is_forced = bool(raw_track.get("forced"))
+             track_entries.append((int(raw_track["id"]), title, lang, is_default, is_forced, raw_track))
+ 
++        # ISO：mpv 的 .m2ts 流不带语言，用 .clpi ProgramInfo 语言按同类型顺序补（仅补空 lang）
++        if self._iso_track_languages:
++            track_entries = [
++                (
++                    track_id,
++                    title,
++                    lang or self._iso_language_for_track("subtitle", sub_index),
++                    is_default,
++                    is_forced,
++                    raw_track,
++                )
++                for sub_index, (track_id, title, lang, is_default, is_forced, raw_track) in enumerate(track_entries)
++            ]
++
+         base_labels = [
+             self._subtitle_track_label(title, lang, is_default, is_forced, index + 1)
+             for index, (_, title, lang, is_default, is_forced, _) in enumerate(track_entries)
+         ]
+         duplicate_labels = {label for label in base_labels if base_labels.count(label) > 1}
+ 
+-        tracks: list[SubtitleTrack] = []
++        # 先按原逻辑给重复标签追加编解码器（如 [PGS]）。
++        labels = list(base_labels)
+         for index, (track_id, title, lang, is_default, is_forced, raw_track) in enumerate(track_entries):
+-            label = base_labels[index]
+-            if label in duplicate_labels:
++            if labels[index] in duplicate_labels:
+                 detail_parts = self._subtitle_track_detail_parts(raw_track)
+                 if detail_parts:
+-                    label = f"{label} [{ ' / '.join(detail_parts) }]"
++                    labels[index] = f"{labels[index]} [{ ' / '.join(detail_parts) }]"
++        # 同编解码器的仍重复（如多条简体中文 PGS），再追加轨道 ID 区分（与音频菜单的 ID 格式一致）。
++        still_duplicate = {label for label in labels if labels.count(label) > 1}
++        for index, (track_id, title, lang, is_default, is_forced, raw_track) in enumerate(track_entries):
++            if labels[index] in still_duplicate:
++                labels[index] = f"{labels[index]} [ID {track_id}]"
++
++        tracks: list[SubtitleTrack] = []
++        for index, (track_id, title, lang, is_default, is_forced, raw_track) in enumerate(track_entries):
++            label = labels[index]
+             tracks.append(
+                 SubtitleTrack(
+                     id=track_id,
+@@ -2615,6 +2653,20 @@ class MpvWidget(QWidget):
+                 )
+             )
+ 
++        # ISO：同字幕，mpv 的 .m2ts 流不带语言，用 .clpi ProgramInfo 语言按同类型顺序补（仅补空 lang）
++        if self._iso_track_languages:
++            track_entries = [
++                (
++                    track_id,
++                    title,
++                    lang or self._iso_language_for_track("audio", audio_index),
++                    is_default,
++                    is_forced,
++                    raw_track,
++                )
++                for audio_index, (track_id, title, lang, is_default, is_forced, raw_track) in enumerate(track_entries)
++            ]
++
+         base_labels = [
+             self._audio_track_label(title, lang, is_default, is_forced, index + 1)
+             for index, (_, title, lang, is_default, is_forced, _) in enumerate(track_entries)
+diff --git a/src/atv_player/ui/player_window.py b/src/atv_player/ui/player_window.py
+index 8b1b313..0242777 100644
+--- a/src/atv_player/ui/player_window.py
++++ b/src/atv_player/ui/player_window.py
+@@ -832,6 +832,9 @@ class SubtitlePreference:
+     lang: str = ""
+     is_default: bool = False
+     is_forced: bool = False
++    # 手动选的轨道 id。ISO 里多条同语言轨的 title/lang/forced/default 都一样，
++    # 只按这四项匹配会永远回到第一条同语言轨；按 id 优先匹配才不跳回。
++    track_id: int | None = None
+ 
+ 
+ @dataclass(slots=True)
+@@ -841,6 +844,7 @@ class SecondarySubtitlePreference:
+     lang: str = ""
+     is_default: bool = False
+     is_forced: bool = False
++    track_id: int | None = None
+ 
+ 
+ @dataclass(slots=True)
+@@ -850,6 +854,7 @@ class AudioPreference:
+     lang: str = ""
+     is_default: bool = False
+     is_forced: bool = False
++    track_id: int | None = None
+ 
+ 
+ @dataclass(slots=True)
+@@ -7337,6 +7342,23 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+         if pending_prepare.requested_dash_video_id:
+             current_item.dash_video_id = pending_prepare.requested_dash_video_id
+         current_item.url = prepared_url
++        # ISO 轨道语言：mpv 的 .m2ts 流不带语言，用 M3U8AdFilter 里 .clpi 的语言补标签。
++        # 按本次 prepare 返回的代理 URL 取（多次 prepare 会互相覆盖共享的“上一次”状态）。
++        # 非 ISO 文件时清 ()，避免上一个 ISO 的语言串到下一个文件。
++        iso_languages: tuple[tuple[str, str], ...] = ()
++        if is_remote_iso_url(pending_prepare.source_url):
++            languages_getter = getattr(self._m3u8_ad_filter, "get_iso_stream_languages", None)
++            if callable(languages_getter):
++                try:
++                    iso_languages = tuple(languages_getter(prepared_url) or ())
++                except Exception:
++                    iso_languages = ()
++        language_setter = getattr(self.video, "set_iso_track_languages", None)
++        if callable(language_setter):
++            try:
++                language_setter(iso_languages)
++            except Exception:
++                pass
+         if external_audio_url:
+             current_item.audio_url = external_audio_url
+             logger.info(
+@@ -8214,6 +8236,7 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             lang=track.lang,
+             is_default=track.is_default,
+             is_forced=track.is_forced,
++            track_id=track.id,
+         )
+ 
+     def _current_item_external_subtitles(self) -> list[ExternalSubtitleOption]:
+@@ -8673,6 +8696,7 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             lang=track.lang,
+             is_default=track.is_default,
+             is_forced=track.is_forced,
++            track_id=track.id,
+         )
+ 
+     def _audio_track_match_score(self, track: AudioTrack, preference: AudioPreference) -> tuple[int, int, int]:
+@@ -8685,6 +8709,13 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+     def _matching_audio_track_for_preference(self) -> AudioTrack | None:
+         if self._audio_preference.mode != "track" or len(self._audio_tracks) <= 1:
+             return None
++        if self._audio_preference.track_id is not None:
++            by_id = next(
++                (t for t in self._audio_tracks if t.id == self._audio_preference.track_id),
++                None,
++            )
++            if by_id is not None:
++                return by_id
+         ranked_tracks = sorted(
+             self._audio_tracks,
+             key=lambda track: self._audio_track_match_score(track, self._audio_preference),
+@@ -8813,6 +8844,14 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+     def _matching_track_for_preference(self) -> SubtitleTrack | None:
+         if self._subtitle_preference.mode != "track" or not self._subtitle_tracks:
+             return None
++        # 优先按 id 匹配（同语言多轨时 title/lang 区分不了，按 id 才不跳回第一条）。
++        if self._subtitle_preference.track_id is not None:
++            by_id = next(
++                (t for t in self._subtitle_tracks if t.id == self._subtitle_preference.track_id),
++                None,
++            )
++            if by_id is not None:
++                return by_id
+         ranked_tracks = sorted(
+             self._subtitle_tracks,
+             key=lambda track: self._subtitle_track_match_score(track, self._subtitle_preference),
+@@ -8837,6 +8876,13 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+     def _matching_secondary_track_for_preference(self) -> SubtitleTrack | None:
+         if self._secondary_subtitle_preference.mode != "track" or not self._subtitle_tracks:
+             return None
++        if self._secondary_subtitle_preference.track_id is not None:
++            by_id = next(
++                (t for t in self._subtitle_tracks if t.id == self._secondary_subtitle_preference.track_id),
++                None,
++            )
++            if by_id is not None:
++                return by_id
+         ranked_tracks = sorted(
+             self._subtitle_tracks,
+             key=lambda track: self._secondary_subtitle_track_match_score(track, self._secondary_subtitle_preference),
+@@ -9641,6 +9687,11 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             return
+         track = next((track for track in self._subtitle_tracks if track.id == track_id), None)
+         if track is None:
++            # Fallback：当前轨道列表里没有该 id（ISO .m2ts 轨道列表变了）。
++            # 直接用 combo 的 track_id 调 apply，不静默丢弃这次选择。
++            self._mark_manual_subtitle_switch_refresh()
++            self.video.apply_subtitle_mode("track", track_id=track_id)
++            self._clear_primary_external_subtitle()
+             return
+         self._remember_track_preference(track)
+         self._mark_manual_subtitle_switch_refresh()
+@@ -9844,6 +9895,8 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             return
+         track = next((track for track in self._audio_tracks if track.id == track_id), None)
+         if track is None:
++            # Fallback：同主字幕，当前轨道列表里没有该 id 时直接用 combo 的 track_id 调 apply。
++            self.video.apply_audio_mode("track", track_id=track_id)
+             return
+         self._remember_audio_track_preference(track)
+         self.video.apply_audio_mode("track", track_id=track_id)
+@@ -12198,11 +12251,18 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+         for track in self._subtitle_tracks:
+             action = menu.addAction(track.label)
+             action.setCheckable(True)
+-            action.setChecked(
+-                self._subtitle_preference.mode == "track"
+-                and self._subtitle_preference.title == track.title
+-                and self._subtitle_preference.lang == track.lang
+-            )
++            # 按 track_id 勾（同语言多轨时 title/lang 区分不了，会全勾；track_id 为空时退回 title/lang）。
++            if getattr(self._subtitle_preference, "track_id", None) is not None:
++                action.setChecked(
++                    self._subtitle_preference.mode == "track"
++                    and self._subtitle_preference.track_id == track.id
++                )
++            else:
++                action.setChecked(
++                    self._subtitle_preference.mode == "track"
++                    and self._subtitle_preference.title == track.title
++                    and self._subtitle_preference.lang == track.lang
++                )
+             action.triggered.connect(
+                 lambda _checked=False, track_id=track.id: self._set_primary_subtitle_from_menu("track", track_id)
+             )
+@@ -12241,11 +12301,17 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+         for track in self._subtitle_tracks:
+             action = menu.addAction(track.label)
+             action.setCheckable(True)
+-            action.setChecked(
+-                self._secondary_subtitle_preference.mode == "track"
+-                and self._secondary_subtitle_preference.title == track.title
+-                and self._secondary_subtitle_preference.lang == track.lang
+-            )
++            if getattr(self._secondary_subtitle_preference, "track_id", None) is not None:
++                action.setChecked(
++                    self._secondary_subtitle_preference.mode == "track"
++                    and self._secondary_subtitle_preference.track_id == track.id
++                )
++            else:
++                action.setChecked(
++                    self._secondary_subtitle_preference.mode == "track"
++                    and self._secondary_subtitle_preference.title == track.title
++                    and self._secondary_subtitle_preference.lang == track.lang
++                )
+             action.triggered.connect(
+                 lambda _checked=False, track_id=track.id: self._set_secondary_subtitle_from_menu("track", track_id)
+             )
+@@ -12555,6 +12621,15 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             ):
+                 self.subtitle_combo.setCurrentIndex(index)
+                 return
++        # Fallback：轨道不在 combo 里（ISO .m2ts 轨道列表变了，combo 已用新列表重建，
++        # 菜单是旧列表）。直接用菜单的 track_id 调 apply，不静默丢弃这次选择。
++        if mode == "track" and track_id is not None:
++            track = next((t for t in self._subtitle_tracks if t.id == track_id), None)
++            if track is not None:
++                self._remember_track_preference(track)
++            self._mark_manual_subtitle_switch_refresh()
++            self.video.apply_subtitle_mode("track", track_id=track_id)
++            self._clear_primary_external_subtitle()
+ 
+     def _set_audio_from_menu(self, mode: str, track_id: int | None) -> None:
+         if mode == "auto":
+@@ -12564,6 +12639,12 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             if self.audio_combo.itemData(index) == (mode, track_id):
+                 self.audio_combo.setCurrentIndex(index)
+                 return
++        # Fallback：同主字幕，轨道不在 combo 里时直接用菜单的 track_id 调 apply。
++        if mode == "track" and track_id is not None:
++            track = next((t for t in self._audio_tracks if t.id == track_id), None)
++            if track is not None:
++                self._remember_audio_track_preference(track)
++            self.video.apply_audio_mode("track", track_id=track_id)
+ 
+     def _set_video_quality_from_menu(self, quality_id: str) -> None:
+         for index in range(self.video_quality_combo.count()):
+@@ -12595,6 +12676,10 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+                 return
+             track = next((track for track in self._subtitle_tracks if track.id == track_id), None)
+             if track is None:
++                # Fallback：同主字幕，当前轨道列表里没有该 id 时直接用菜单的 track_id 调 apply。
++                self.video.apply_secondary_subtitle_mode("track", track_id=track_id)
++                self._secondary_subtitle_preference = SecondarySubtitlePreference(mode="track", track_id=track_id)
++                self._clear_secondary_external_subtitle()
+                 return
+             self.video.apply_secondary_subtitle_mode("track", track_id=track.id)
+             self._secondary_subtitle_preference = SecondarySubtitlePreference(
+@@ -12603,6 +12688,7 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+                 lang=track.lang,
+                 is_default=track.is_default,
+                 is_forced=track.is_forced,
++                track_id=track.id,
+             )
+             self._clear_secondary_external_subtitle()
+         except Exception as exc:

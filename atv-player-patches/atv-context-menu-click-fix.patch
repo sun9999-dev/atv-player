@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Sat, 17 Oct 2026 23:30:00 +0800
+Subject: [PATCH] fix: make video context menu items larger and easier to click
+
+The right-click menu is built fresh on every right-click with
+default Qt sizing (small font, tight padding), so its items and
+hover-opened submenus are hard to hit precisely.
+
+Give the menu a size-only stylesheet (no colors, so the app
+light/dark theme still applies): larger font, taller items with
+more padding, so each item is a bigger click target. The
+stylesheet cascades to the submenus (children of this menu).
+---
+ src/atv_player/ui/player_window.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/atv_player/ui/player_window.py b/src/atv_player/ui/player_window.py
+--- a/src/atv_player/ui/player_window.py
++++ b/src/atv_player/ui/player_window.py
+@@ -10440,6 +10440,11 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+     def _build_video_context_menu(self) -> QMenu:
+         menu = QMenu(self)
++        # 菜单项加大、加高，更好点（只改尺寸，不动颜色，主题仍生效）。
++        menu.setStyleSheet(
++            "QMenu { font-size: 15px; }"
++            "QMenu::item { padding: 5px 28px 5px 16px; min-height: 12px; }"
++        )
+         # 直播会话:章节/刮削/重写剧集标题/搜索字幕/弹幕源/弹幕设置都是点播概念,不进菜单;
+         # "弹幕配置"子菜单在直播模式镜像弹幕下拉框(弹幕/关闭),与"直播弹幕"开关重复,同样不进。
+         live = self._current_session_is_live()
+         menu.addMenu(self._build_primary_subtitle_menu(menu))
+-- 
+2.0.0

@@ -1,0 +1,73 @@
+diff --git a/src/atv_player/player/mpv_widget.py b/src/atv_player/player/mpv_widget.py
+index c2450ef..f50aff5 100644
+--- a/src/atv_player/player/mpv_widget.py
++++ b/src/atv_player/player/mpv_widget.py
+@@ -756,6 +756,8 @@ class MpvWidget(_MpvWidgetBase):
+         # mpv_get_property 会等 demuxer 锁,曾把同步轮询的主线程冻住分钟级。
+         self._observed_properties: dict[str, object] = {}
+         self._observed_property_handlers: list[object] = []
++        # ISO（.clpi）流语言，仅补空 lang，不动去重/标签结构。
++        self._iso_track_languages: tuple[tuple[str, str], ...] = ()
+         self._audio_cover_active = False
+         self._audio_cover_mode = False
+         self._playback_finished_emitted = False
+@@ -2484,6 +2486,17 @@ class MpvWidget(_MpvWidgetBase):
+             int(bool(track.title)),
+         )
+ 
++    def set_iso_track_languages(self, languages: tuple[tuple[str, str], ...] | list[tuple[str, str]] | None) -> None:
++        """设置 ISO（.clpi）流语言；非 ISO 传 () 清空。仅存元组，无 Qt 调用。"""
++        self._iso_track_languages = tuple(languages or ())
++
++    def _iso_language_for_track(self, kind: str, index: int) -> str:
++        """取 .clpi 里第 index 条该类型流的语言（同类型顺序）；没有返回 ""。"""
++        langs = [lang for item_kind, lang in self._iso_track_languages if item_kind == kind]
++        if 0 <= index < len(langs):
++            return langs[index]
++        return ""
++
+     def subtitle_tracks(self) -> list[SubtitleTrack]:
+         if not self._on_widget_thread():
+             return list(self._run_on_widget_thread(self.subtitle_tracks) or [])
+@@ -2504,6 +2517,20 @@ class MpvWidget(_MpvWidgetBase):
+             is_forced = bool(raw_track.get("forced"))
+             track_entries.append((int(raw_track["id"]), title, lang, is_default, is_forced, raw_track))
+ 
++        # ISO：mpv 的 .m2ts 流不带语言，用 .clpi 语言按同类型顺序补（仅补空 lang）。
++        if self._iso_track_languages:
++            track_entries = [
++                (
++                    track_id,
++                    title,
++                    lang or self._iso_language_for_track("subtitle", sub_index),
++                    is_default,
++                    is_forced,
++                    raw_track,
++                )
++                for sub_index, (track_id, title, lang, is_default, is_forced, raw_track) in enumerate(track_entries)
++            ]
++
+         base_labels = [
+             self._subtitle_track_label(title, lang, is_default, is_forced, index + 1)
+             for index, (_, title, lang, is_default, is_forced, _) in enumerate(track_entries)
+@@ -3043,6 +3070,20 @@ class MpvWidget(_MpvWidgetBase):
+                 )
+             )
+ 
++        # ISO：同字幕，仅补空 lang。
++        if self._iso_track_languages:
++            track_entries = [
++                (
++                    track_id,
++                    title,
++                    lang or self._iso_language_for_track("audio", audio_index),
++                    is_default,
++                    is_forced,
++                    raw_track,
++                )
++                for audio_index, (track_id, title, lang, is_default, is_forced, raw_track) in enumerate(track_entries)
++            ]
++
+         base_labels = [
+             self._audio_track_label(title, lang, is_default, is_forced, index + 1)
+             for index, (_, title, lang, is_default, is_forced, _) in enumerate(track_entries)
