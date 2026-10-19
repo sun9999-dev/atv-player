@@ -1,0 +1,14 @@
+macos intel build patch
+
+cd ~/src/atv-player
+git checkout -- .
+git apply --exclude=src/atv_player/player/mpv_widget.py ~/atv-player-patches/atv-iso-track-all-v8.patch
+git apply ~/atv-player-patches/atv-subtitle-off-fix.patch
+git apply ~/atv-player-patches/atv-context-menu-click-fix.patch
+cp ~/atv-player-patches/mpv_widget.py src/atv_player/player/mpv_widget.py
+git apply ~/atv-player-patches/atv-iso-on-render-fix-v2.patch
+git status --short
+uv run python ~/atv-player-patches/standalone_player_atv_v2.py
+
+
+bash ~/atv-player-patches/build-player-app.sh
