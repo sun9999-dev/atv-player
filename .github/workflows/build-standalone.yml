@@ -90,14 +90,7 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/player-mac"
           ls -la
-          # 若 .app 外壳丢失（只有 Contents/），重建一个
-          if ! ls -d *.app >/dev/null 2>&1; then
-            mkdir -p "tmp.app"
-            mv Contents "tmp.app/"
-            mv "tmp.app" "Player.app"
-          fi
-          ls -d *.app
-          ditto -c -k --sequesterRsrc --keepParent *.app "player-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent ATVPlayer.app "player-arm64.zip"
           ls -lh *.zip
 
       - name: Upload macOS artifact
