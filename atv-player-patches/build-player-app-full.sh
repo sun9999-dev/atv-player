@@ -4,9 +4,9 @@
 # 要求：~/src/atv-player 已打好补丁（v8 除 mpv_widget + 字幕关闭 + 菜单手感 + 渲染文件覆盖 + ISO-on-render v2）。
 set -euo pipefail
 OUT_DIR="${1:-/Applications}"
-SRC="$HOME/src/atv-player"
-PATCHES="$HOME/atv-player-patches"
-MPV_LIB="$HOME/mpv-dist/lib"
+SRC="${SRC:-$HOME/src/atv-player}"
+PATCHES="${PATCHES:-$HOME/atv-player-patches}"
+MPV_LIB="${MPV_LIB:-$HOME/mpv-dist/lib}"
 WORK="$HOME/.cache/player-full-build"
 APP_NAME="播放器"
 
