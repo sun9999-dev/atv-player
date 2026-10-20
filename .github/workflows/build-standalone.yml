@@ -66,22 +66,25 @@ jobs:
 
       - name: Apply patches (pristine v0.105.0 + fixed order)
         run: |
+          cp -r atv-player-patches "$RUNNER_TEMP/patches"
+          cp atv-player-patches/build-player-app-full.sh "$RUNNER_TEMP/"
           git remote add upstream https://github.com/power721/atv-player.git 2>/dev/null || true
           git fetch upstream tag v0.105.0
           git reset --hard v0.105.0
-          git apply --exclude=src/atv_player/player/mpv_widget.py atv-player-patches/atv-iso-track-all-v8.patch
-          git apply atv-player-patches/atv-subtitle-off-fix.patch
-          git apply atv-player-patches/atv-context-menu-click-fix.patch
-          cp atv-player-patches/mpv_widget.py src/atv_player/player/mpv_widget.py
-          git apply atv-player-patches/atv-iso-on-render-fix-v2.patch
+          P="$RUNNER_TEMP/patches"
+          git apply --exclude=src/atv_player/player/mpv_widget.py "$P/atv-iso-track-all-v8.patch"
+          git apply "$P/atv-subtitle-off-fix.patch"
+          git apply "$P/atv-context-menu-click-fix.patch"
+          cp "$P/mpv_widget.py" src/atv_player/player/mpv_widget.py
+          git apply "$P/atv-iso-on-render-fix-v2.patch"
           git status --short
 
       - name: Build (PyInstaller, .app)
         run: |
           export SRC="$GITHUB_WORKSPACE"
-          export PATCHES="$GITHUB_WORKSPACE/atv-player-patches"
+          export PATCHES="$RUNNER_TEMP/patches"
           export MPV_LIB=/opt/homebrew/opt/mpv/lib
-          bash atv-player-patches/build-player-app-full.sh "$RUNNER_TEMP/player-mac"
+          bash "$RUNNER_TEMP/build-player-app-full.sh" "$RUNNER_TEMP/player-mac"
 
       - name: Zip .app
         run: |
