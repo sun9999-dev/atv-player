@@ -1,0 +1,94 @@
+name: Build Standalone Player
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Unzip Windows build kit
+        shell: pwsh
+        run: |
+          Expand-Archive -Path "atv-player-windows-build-kit.zip" -DestinationPath "$env:RUNNER_TEMP\win-kit" -Force
+          Get-ChildItem "$env:RUNNER_TEMP\win-kit\windows-build-kit"
+
+      - name: Build (PyInstaller, onedir)
+        shell: pwsh
+        run: |
+          $kit = "$env:RUNNER_TEMP\win-kit\windows-build-kit"
+          & "$kit\build-player-windows.ps1" `
+            -PatchesDir "$kit\patches" `
+            -SrcDir "$env:GITHUB_WORKSPACE" `
+            -OutDir "$env:RUNNER_TEMP\player-win"
+          "OUT_DIR=$env:RUNNER_TEMP\player-win" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64-standalone
+          path: ${{ env.OUT_DIR }}\播放器-*.zip
+          retention-days: 30
+
+  build-macos:
+    name: Build macOS (arm64)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install arm64 libmpv
+        run: brew install mpv
+
+      - name: Apply patches (pristine v0.105.0 + fixed order)
+        run: |
+          git reset --hard v0.105.0
+          git apply --exclude=src/atv_player/player/mpv_widget.py atv-player-patches/atv-iso-track-all-v8.patch
+          git apply atv-player-patches/atv-subtitle-off-fix.patch
+          git apply atv-player-patches/atv-context-menu-click-fix.patch
+          cp atv-player-patches/mpv_widget.py src/atv_player/player/mpv_widget.py
+          git apply atv-player-patches/atv-iso-on-render-fix-v2.patch
+          git status --short
+
+      - name: Build (PyInstaller, .app)
+        run: |
+          export SRC="$GITHUB_WORKSPACE"
+          export PATCHES="$GITHUB_WORKSPACE/atv-player-patches"
+          export MPV_LIB=/opt/homebrew/opt/mpv/lib
+          bash atv-player-patches/build-player-app-full.sh "$RUNNER_TEMP/player-mac"
+
+      - name: Zip .app
+        run: |
+          cd "$RUNNER_TEMP/player-mac"
+          ditto -c -k --sequesterRsrc --keepParent "播放器.app" "播放器-arm64.zip"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64-standalone
+          path: ${{ runner.temp }}/player-mac/播放器-arm64.zip
+          retention-days: 30
