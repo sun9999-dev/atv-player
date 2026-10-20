@@ -89,11 +89,13 @@ jobs:
       - name: Zip .app
         run: |
           cd "$RUNNER_TEMP/player-mac"
-          ditto -c -k --sequesterRsrc --keepParent "播放器.app" "播放器-arm64.zip"
+          ls -la
+          ditto -c -k --sequesterRsrc --keepParent *.app "player-arm64.zip"
+          ls -lh *.zip
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v7
         with:
           name: macos-arm64-standalone
-          path: ${{ runner.temp }}/player-mac/播放器-arm64.zip
+          path: ${{ runner.temp }}/player-mac/player-arm64.zip
           retention-days: 30
