@@ -44,7 +44,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-x64-standalone
-          path: ${{ env.OUT_DIR }}\播放器-*.zip
+          path: ${{ env.OUT_DIR }}\ATVPlayer-*.zip
           retention-days: 30
 
   build-macos:
@@ -77,6 +77,8 @@ jobs:
           git apply "$P/atv-context-menu-click-fix.patch"
           cp "$P/mpv_widget.py" src/atv_player/player/mpv_widget.py
           git apply "$P/atv-iso-on-render-fix-v2.patch"
+          git apply "$P/atv-external-subtitle-v7.patch"
+          grep -q "_open_external_subtitle" src/atv_player/ui/player_window.py || { echo "错误：外挂字幕 v7 没打上"; exit 1; }
           git status --short
 
       - name: Build (PyInstaller, .app)
