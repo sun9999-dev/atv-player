@@ -1,0 +1,140 @@
+--- a/src/atv_player/ui/player_window.py
++++ b/src/atv_player/ui/player_window.py
+@@ -50,6 +50,7 @@
+     QColorDialog,
+     QDoubleSpinBox,
+     QDialog,
++    QFileDialog,
+     QFrame,
+     QHBoxLayout,
+     QGridLayout,
+@@ -10037,6 +10038,120 @@
+             return None
+         return getattr(self.session, "subtitle_search_service", None)
+ 
++    # ---- 外挂字幕（同名文件直接加载，安卓版同逻辑） ----
++    # 本地文件：同目录探测同名精确匹配，再按语言后缀变体（zh / zh-CN / zh-Hans /
++    # zh-Hant / en / cht / chs / ja / ko）排序，命中最高优先级的直接加载；
++    # 远程 URL 或本地没找到时，弹文件选择框手动挑。
++    # 选轨：sub-add 的 auto 不会顶掉已选中的内挂轨，必须显式设 sid；
++    # 若新轨 id 检测不到，退到 track_list 里找外挂轨（id 最大者）强制选中。
++
++    _EXTERNAL_SUBTITLE_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".sub", ".smi", ".sami", ".ttml")
++    _EXTERNAL_SUBTITLE_LANG_SUFFIXES = (
++        "",
++        ".zh", ".zh-CN", ".zh-Hans", ".zh-Hant", ".zh-TW", ".zh-HK",
++        ".chs", ".cht",
++        ".en", ".eng",
++        ".ja", ".jpn",
++        ".ko", ".kor",
++    )
++
++    def _find_same_name_subtitles(self, video_path: str) -> list[str]:
++        """同目录同名 + 语言后缀变体的字幕文件（按优先级排序）。"""
++        p = Path(video_path)
++        if not p.is_file():
++            return []
++        stem = p.stem
++        parent = p.parent
++        found: list[str] = []
++        for suffix in self._EXTERNAL_SUBTITLE_LANG_SUFFIXES:
++            for ext in self._EXTERNAL_SUBTITLE_EXTS:
++                candidate = parent / f"{stem}{suffix}{ext}"
++                if candidate.is_file() and str(candidate) not in found:
++                    found.append(str(candidate))
++        return found
++
++    def _load_external_subtitle_file(self, subtitle_path: str) -> bool:
++        """走原作者的官方外挂通道：挂到播放项，刷新下拉框，切到该条。
++
++        不再直接 sub-add（绕开状态机，选完会被偏好/自动重置回内挂）。
++        复用搜索字幕的加载路径：ExternalSubtitleOption -> external_subtitles
++        -> _refresh_subtitle_state -> _set_primary_subtitle_from_menu("external", path)，
++        播放器自己的状态机负责加载并保持选中。
++        """
++        # .ass 显式字体兜底（Microsoft YaHei 在 macOS 上不存在）
++        try:
++            set_prop = getattr(self.video, "_set_player_property", None)
++            if callable(set_prop):
++                set_prop("sub-ass-force-style", "FontName=PingFang SC")
++        except Exception:
++            pass
++        try:
++            current_item = self._current_play_item()
++        except Exception:
++            current_item = None
++        if current_item is None:
++            self._append_log("当前没有播放项，无法加载外挂字幕")
++            return False
++        try:
++            from atv_player.models import ExternalSubtitleOption
++        except Exception:
++            ExternalSubtitleOption = None
++        if ExternalSubtitleOption is None:
++            self._append_log("无法创建外挂字幕选项")
++            return False
++        import os as _os
++        fmt = _os.path.splitext(subtitle_path)[1].lstrip(".").lower()
++        option = ExternalSubtitleOption(
++            name=_os.path.basename(subtitle_path),
++            lang="",
++            url=subtitle_path,
++            format=fmt,
++            source="local-file",
++        )
++        try:
++            existing = self._find_current_item_external_subtitle(subtitle_path)
++        except Exception:
++            existing = None
++        if existing is None:
++            try:
++                current_item.external_subtitles = [
++                    *current_item.external_subtitles,
++                    option,
++                ]
++            except Exception:
++                current_item.external_subtitles = [option]
++        try:
++            self._refresh_subtitle_state()
++        except Exception:
++            pass
++        try:
++            self._set_primary_subtitle_from_menu("external", subtitle_path)
++        except Exception:
++            pass
++        self._append_log(f"已加载外挂字幕：{subtitle_path}")
++        return True
++
++    def _open_external_subtitle(self) -> None:
++        """外挂字幕：本地文件先找同名字幕（有则直接加载），否则弹文件选择框。"""
++        if self.session is None or not (0 <= self.current_index < len(self.session.playlist)):
++            self._append_log("当前没有播放项，无法加载字幕")
++            return
++        item = self.session.playlist[self.current_index]
++        local_path = str(getattr(item, "path", "") or "")
++        if local_path and not local_path.lower().startswith(("http://", "https://", "bluray://")):
++            candidates = self._find_same_name_subtitles(local_path)
++            if candidates:
++                self._load_external_subtitle_file(candidates[0])
++                return
++        file_path, _ = QFileDialog.getOpenFileName(
++            self,
++            "选择字幕文件",
++            "",
++            "字幕文件 (*.srt *.ass *.ssa *.vtt *.sub *.smi *.sami *.ttml);;所有文件 (*)",
++        )
++        if file_path:
++            self._load_external_subtitle_file(file_path)
++
+     def _open_subtitle_search_dialog(self) -> None:
+         if self._subtitle_search_service() is None:
+             self._append_log("字幕搜索不可用")
+@@ -10527,7 +10642,7 @@
+         if not live:
+             menu.addAction("刮削", self._open_metadata_scrape_dialog)
+             menu.addAction("重写剧集标题", self._rerun_episode_title_enhancement)
+-            menu.addAction("搜索字幕", self._open_subtitle_search_dialog)
++            menu.addAction("外挂字幕", self._open_external_subtitle)
+             menu.addAction("弹幕源", self._open_danmaku_source_dialog)
+             menu.addAction("弹幕设置", self._open_danmaku_settings_dialog)
+         menu.addAction("视频信息", self._toggle_video_info_from_menu)
