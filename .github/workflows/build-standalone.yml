@@ -92,6 +92,13 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/player-mac"
           ls -la
+          # 兜底：build 脚本若没预建输出目录，cp -R 会把 .app 本体拷成 player-mac 自身，
+          # 里面只剩一个裸 Contents/。这时重建成 ATVPlayer.app 再打包。
+          if [ ! -d "ATVPlayer.app" ] && [ -d "Contents" ]; then
+            echo "检测到裸 Contents/，重建成 ATVPlayer.app"
+            mkdir -p ATVPlayer.app
+            mv Contents ATVPlayer.app/
+          fi
           ditto -c -k --sequesterRsrc --keepParent ATVPlayer.app "player-arm64.zip"
           ls -lh *.zip
 
