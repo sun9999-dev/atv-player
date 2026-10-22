@@ -1,5 +1,5 @@
 #!/bin/bash
-# 播放器.app（完整版）：PyInstaller 把 Python + 依赖 + libmpv + 已打补丁源码全打进 .app。
+# ATVPlayer.app（完整版）：PyInstaller 把 Python + 依赖 + libmpv + 已打补丁源码全打进 .app。
 # 用法：bash ~/atv-player-patches/build-player-app-full.sh [输出目录，默认 /Applications]
 # 要求：~/src/atv-player 已打好补丁（v8 除 mpv_widget + 字幕关闭 + 菜单手感 + 渲染文件覆盖 + ISO-on-render v2）。
 set -euo pipefail
@@ -8,7 +8,7 @@ SRC="${SRC:-$HOME/src/atv-player}"
 PATCHES="${PATCHES:-$HOME/atv-player-patches}"
 MPV_LIB="${MPV_LIB:-$HOME/mpv-dist/lib}"
 WORK="$HOME/.cache/player-full-build"
-APP_NAME="播放器"
+APP_NAME="ATVPlayer"
 
 # 1. 校验源码已打补丁
 grep -q "set_iso_track_languages" "$SRC/src/atv_player/player/mpv_widget.py" || { echo "错误：mpv_widget.py 缺 ISO 语言修复（先按复原测试流程打补丁）"; exit 1; }
@@ -104,8 +104,12 @@ with open(p, 'wb') as f:
 "
 
 # 6. 输出到目标目录（直接拷到 /Applications，自动安装，省去手动拖）
+# 必须先 mkdir -p：OUT_DIR 不存在时 cp -R "$APP" "$OUT_DIR/" 会把 .app 本体拷成
+# OUT_DIR 自身（里面只剩裸 Contents/），后续 ditto 找不到 ATVPlayer.app。
+mkdir -p "$OUT_DIR"
 rm -rf "$OUT_DIR/$APP_NAME.app"
 cp -R "$APP" "$OUT_DIR/"
+[ -d "$OUT_DIR/$APP_NAME.app" ] || { echo "错误：$OUT_DIR/$APP_NAME.app 不存在（cp 落点不对）"; ls -la "$OUT_DIR"; exit 1; }
 # 注册 scheme（新装 .app 浏览器可能还没认到）
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$OUT_DIR/$APP_NAME.app" 2>/dev/null || true
 echo "已安装：$OUT_DIR/$APP_NAME.app"
