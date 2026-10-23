@@ -1,0 +1,33 @@
+--- a/src/atv_player/ui/player_window.py
++++ b/src/atv_player/ui/player_window.py
+@@ -10246,14 +10246,27 @@
+         return True
+ 
+     def _maybe_auto_remote_subtitle(self) -> None:
+-        """起播后自动探远端同名字幕（仅远端项、同一播放项只探一次；探不到不弹框）。"""
++        """起播后自动探远端同名字幕（仅远端项、同一播放项只探一次；探不到不弹框）。
++
++        延迟 3 秒再探：首播时视频管线（render context + 首帧）还在初始化，
++        此时改字幕状态会打断首帧渲染，导致有声有字幕但黑屏；等首帧稳定后再探，
++        退出重进时管线已暖所以不复现。延迟期间切集则丢弃（回主线程时校验）。
++        """
+         if self.session is None or not (0 <= self.current_index < len(self.session.playlist)):
+             return
+         item = self.session.playlist[self.current_index]
+         if getattr(self, "_auto_remote_subtitle_probed_item", None) is item:
+             return
+-        if self._start_remote_subtitle_probe(item, for_button=False):
+-            self._auto_remote_subtitle_probed_item = item
++        self._auto_remote_subtitle_probed_item = item
++
++        def _delayed_probe() -> None:
++            if not self._is_window_alive():
++                return
++            if not self._is_current_play_item(item):
++                return
++            self._start_remote_subtitle_probe(item, for_button=False)
++
++        QTimer.singleShot(3000, _delayed_probe)
+ 
+     def _is_current_play_item(self, item) -> bool:
+         """后台探测结果回主线程时校验：播放项是否还是探测时的那一项（切集后丢弃过期结果）。"""

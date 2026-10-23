@@ -1,0 +1,258 @@
+diff --git a/src/atv_player/ui/player_window.py b/src/atv_player/ui/player_window.py
+index 7803860..519010a 100644
+--- a/src/atv_player/ui/player_window.py
++++ b/src/atv_player/ui/player_window.py
+@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
+ from datetime import datetime
+ from pathlib import Path
+ from typing import cast
+-from urllib.parse import urlparse
++from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
+ 
+ import httpx
+ import shiboken6
+@@ -158,7 +158,7 @@ from atv_player.playlist_sorting import (
+     PlaylistSortState,
+     find_playlist_item_index,
+ )
+-from atv_player.request_headers import normalize_media_request_headers
++from atv_player.request_headers import BROWSER_USER_AGENT, normalize_media_request_headers
+ from atv_player.ui.async_guard import AsyncGuardMixin
+ from atv_player.ui.bilibili_comments_dialog import BilibiliCommentsDialog
+ from atv_player.ui.external_links import external_link_html
+@@ -811,6 +811,12 @@ class _SubtitleSearchSignals(QObject):
+     failed = Signal(int, str)
+ 
+ 
++class _UrlSubtitleProbeSignals(QObject):
++    # found: (播放项, 远端字幕地址, 是否按钮触发)；not_found: (播放项, 是否按钮触发)
++    found = Signal(object, str, bool)
++    not_found = Signal(object, bool)
++
++
+ # 结果表列序：来源 / 名称 / 语言 / 格式 / 匹配度
+ _SUBTITLE_SEARCH_COLUMNS = ("来源", "字幕", "语言", "格式", "匹配度")
+ _SUBTITLE_SEARCH_NAME_COLUMN = 1
+@@ -1323,6 +1329,10 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             self._handle_subtitle_download_succeeded
+         )
+         self._subtitle_search_signals.failed.connect(self._handle_subtitle_search_failed)
++        self._url_subtitle_probe_signals = _UrlSubtitleProbeSignals()
++        self._url_subtitle_probe_signals.found.connect(self._handle_remote_subtitle_found)
++        self._url_subtitle_probe_signals.not_found.connect(self._handle_remote_subtitle_not_found)
++        self._auto_remote_subtitle_probed_item = None
+         self._connect_async_signal(
+             self._metadata_scrape_signals.search_succeeded,
+             self._handle_metadata_scrape_search_succeeded,
+@@ -5479,6 +5489,8 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+         # dramas), and it shares the serial controller-task queue — so kick it off only
+         # after playback has started, never before.
+         self._maybe_restore_cached_danmaku_for_current_item()
++        # 远端同名外挂字幕：起播后后台探测，探到自动挂载（与 Android 对齐）
++        self._maybe_auto_remote_subtitle()
+ 
+     def _format_metadata_text(self, vod) -> str:
+         if getattr(vod, "detail_style", "") == "youtube":
+@@ -10076,7 +10088,7 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+         return True
+ 
+     def _open_external_subtitle(self) -> None:
+-        """外挂字幕：本地文件先找同名字幕（有则直接加载），否则弹文件选择框。"""
++        """外挂字幕：本地文件先找同名字幕（有则直接加载），远端先探同名（有则加载，没有再弹框），否则弹文件选择框。"""
+         if self.session is None or not (0 <= self.current_index < len(self.session.playlist)):
+             self._append_log("当前没有播放项，无法加载字幕")
+             return
+@@ -10087,6 +10099,11 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             if candidates:
+                 self._load_external_subtitle_file(candidates[0])
+                 return
++        elif local_path.lower().startswith(("http://", "https://")):
++            # 远端：后台探同名，探到加载、探不到再弹框（不在 UI 线程做网络请求）
++            if self._start_remote_subtitle_probe(item, for_button=True):
++                self._append_log("正在探测远端同名字幕…")
++                return
+         file_path, _ = QFileDialog.getOpenFileName(
+             self,
+             "选择字幕文件",
+@@ -10096,6 +10113,181 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+         if file_path:
+             self._load_external_subtitle_file(file_path)
+ 
++    def _remote_video_url_for_item(self, item) -> str | None:
++        """取可用于推导同名字幕的远端地址：优先 path，其次 original_url、url；跳过本机代理地址。"""
++        for attr in ("path", "original_url", "url"):
++            value = str(getattr(item, attr, "") or "").strip()
++            if not value:
++                continue
++            lowered = value.lower()
++            if not lowered.startswith(("http://", "https://")):
++                continue
++            host = lowered.split("://", 1)[1].split("/", 1)[0].split("@")[-1].split(":")[0]
++            if host in ("127.0.0.1", "localhost", "::1"):
++                continue
++            return value
++        return None
++
++    def _remote_subtitle_exists(self, url: str, headers: dict) -> bool:
++        """远端字幕是否存在：先 HEAD，HEAD 不可用/被拒时用流式 GET 只看状态码（不对付 HEAD 畸形的服务器）。"""
++        try:
++            response = httpx.head(url, headers=headers, timeout=10.0, follow_redirects=True)
++            if response.status_code in (200, 206):
++                return True
++        except Exception:
++            pass
++        try:
++            with httpx.stream("GET", url, headers=headers, timeout=10.0, follow_redirects=True) as response:
++                return response.status_code in (200, 206)
++        except Exception:
++            return False
++
++    def _probe_remote_same_name_subtitle(self, video_url: str, headers: dict) -> str | None:
++        """远端同名外挂字幕探测：只认精确同名（不含语言后缀变体，下不到的按不存在处理）。
++
++        带原 query 先试（签名未绑定路径时能用），再试不带 query（签名绑定路径时原 query 必然验签失败）。
++        """
++        parts = urlsplit(video_url)
++        path = parts.path
++        dot = path.rfind(".")
++        slash = path.rfind("/")
++        if dot <= slash:
++            return None
++        base = path[:dot]
++        for ext in self._EXTERNAL_SUBTITLE_EXTS:
++            candidates = []
++            if parts.query:
++                candidates.append(urlunsplit((parts.scheme, parts.netloc, base + ext, parts.query, "")))
++            candidates.append(urlunsplit((parts.scheme, parts.netloc, base + ext, "", "")))
++            for candidate in candidates:
++                if self._remote_subtitle_exists(candidate, headers):
++                    return candidate
++        return None
++
++    def _start_remote_subtitle_probe(self, item, *, for_button: bool) -> bool:
++        """为远端播放项启动同名外挂字幕探测（后台线程）。返回 True 表示已启动，调用方直接返回；False 表示无法探测，调用方走原有逻辑。"""
++        video_url = self._remote_video_url_for_item(item)
++        if not video_url:
++            return False
++        headers = dict(getattr(item, "headers", {}) or {})
++        if not any(key.lower() == "user-agent" for key in headers):
++            headers["User-Agent"] = BROWSER_USER_AGENT
++        signals = self._url_subtitle_probe_signals
++
++        def run() -> None:
++            try:
++                found = self._probe_remote_same_name_subtitle(video_url, headers)
++            except Exception:
++                found = None
++            if not self._is_window_alive():
++                return
++            if found:
++                signals.found.emit(item, found, for_button)
++            else:
++                signals.not_found.emit(item, for_button)
++
++        threading.Thread(target=run, daemon=True).start()
++        return True
++
++    def _maybe_auto_remote_subtitle(self) -> None:
++        """起播后自动探远端同名字幕（仅远端项、同一播放项只探一次；探不到不弹框）。"""
++        if self.session is None or not (0 <= self.current_index < len(self.session.playlist)):
++            return
++        item = self.session.playlist[self.current_index]
++        if getattr(self, "_auto_remote_subtitle_probed_item", None) is item:
++            return
++        if self._start_remote_subtitle_probe(item, for_button=False):
++            self._auto_remote_subtitle_probed_item = item
++
++    def _is_current_play_item(self, item) -> bool:
++        """后台探测结果回主线程时校验：播放项是否还是探测时的那一项（切集后丢弃过期结果）。"""
++        return (
++            self.session is not None
++            and 0 <= self.current_index < len(self.session.playlist)
++            and self.session.playlist[self.current_index] is item
++        )
++
++    def _handle_remote_subtitle_found(self, item, subtitle_url: str, for_button: bool) -> None:
++        if not self._is_current_play_item(item):
++            return
++        self._load_remote_subtitle_option(subtitle_url)
++
++    def _handle_remote_subtitle_not_found(self, item, for_button: bool) -> None:
++        if not self._is_current_play_item(item):
++            return
++        if not for_button:
++            return
++        # 按钮触发：探不到才弹本地文件框（与原来远端直接弹框一致）
++        file_path, _ = QFileDialog.getOpenFileName(
++            self,
++            "选择字幕文件",
++            "",
++            "字幕文件 (*.srt *.ass *.ssa *.vtt *.sub *.smi *.sami *.ttml);;所有文件 (*)",
++        )
++        if file_path:
++            self._load_external_subtitle_file(file_path)
++
++    def _load_remote_subtitle_option(self, subtitle_url: str) -> bool:
++        """远端同名字幕：走原作者官方外挂通道（与本地外挂同一条路，只换 url 来源）。
++
++        不直接 sub-add（绕开状态机，选完会被偏好/自动重置回内挂）。远端地址本身
++        交给既有的 _fetch_external_subtitle_text 在选中时用 httpx 拉取，不在这里下载正文。
++        """
++        try:
++            set_prop = getattr(self.video, "_set_player_property", None)
++            if callable(set_prop):
++                set_prop("sub-ass-force-style", "FontName=PingFang SC")
++        except Exception:
++            pass
++        try:
++            current_item = self._current_play_item()
++        except Exception:
++            current_item = None
++        if current_item is None:
++            self._append_log("当前没有播放项，无法加载外挂字幕")
++            return False
++        try:
++            from atv_player.models import ExternalSubtitleOption
++        except Exception:
++            ExternalSubtitleOption = None
++        if ExternalSubtitleOption is None:
++            self._append_log("无法创建外挂字幕选项")
++            return False
++        url_path = urlsplit(subtitle_url).path
++        filename = unquote(url_path.rsplit("/", 1)[-1]) if "/" in url_path else unquote(url_path)
++        fmt = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
++        option = ExternalSubtitleOption(
++            name=filename,
++            lang="",
++            url=subtitle_url,
++            format=fmt,
++            source="remote-file",
++        )
++        try:
++            existing = self._find_current_item_external_subtitle(subtitle_url)
++        except Exception:
++            existing = None
++        if existing is None:
++            try:
++                current_item.external_subtitles = [
++                    *current_item.external_subtitles,
++                    option,
++                ]
++            except Exception:
++                current_item.external_subtitles = [option]
++            self._append_log(f"已加载外挂字幕（远端同名）：{filename}")
++        else:
++            self._append_log(f"同名字幕已挂载：{filename}")
++        try:
++            self._refresh_subtitle_state()
++        except Exception:
++            pass
++        try:
++            self._set_primary_subtitle_from_menu("external", subtitle_url)
++        except Exception:
++            pass
++        return True
++
+     def _open_subtitle_search_dialog(self) -> None:
+         if self._subtitle_search_service() is None:
+             self._append_log("字幕搜索不可用")

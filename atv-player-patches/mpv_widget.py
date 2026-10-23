@@ -663,10 +663,18 @@ class _MpvGLWindow(QOpenGLWindow):
         # 不渲染。否则第一次播放的渲染会丢（白屏），要退出重播
         # 第二次才正常。等 expose 后再建上下文，渲染才落到屏幕上。
         if not self.isExposed():
+            # 未 expose 时也不能直接丢弃：内嵌窗口在 macOS 上 exposeEvent
+            # 可能不触发，丢了就再也没人叫 paintGL，一直黑到换新窗口。
+            # 排队重试，等 expose 后下一轮 paintGL 就能建上下文并渲染。
+            self.update()
             return
         player = self._owner._player
         if player is None or getattr(player, "core_shutdown", False):
             self._clear_gl_black()
+            # 首播时窗口可能先于 mpv 实例画第一帧：直接返回且不重试会死锁
+            # （渲染上下文没建，mpv 也就永远不会回调触发重绘），直到退出重进。
+            # 排队一次重绘，等 mpv 实例挂上后再跑；Qt 会合并 update 请求，不会空转。
+            self.update()
             return
         if self._render_context is None:
             try:
@@ -676,6 +684,9 @@ class _MpvGLWindow(QOpenGLWindow):
                 created = False
             if not created:
                 self._clear_gl_black()
+                # 建上下文 transient 失败（如 GL 上下文未就绪）也重试一次，
+                # 否则同样死锁到退出重进。
+                self.update()
                 return
             # 建上下文和渲染拆成两次 paintGL：第一次只建上下文、不渲染，
             # 立刻 update() 触发第二次 paintGL 再渲染。第一次建上下文时
@@ -706,6 +717,15 @@ class _MpvGLWindow(QOpenGLWindow):
 
     def resizeGL(self, w: int, h: int) -> None:
         self.update()
+
+    def exposeEvent(self, event) -> None:
+        super().exposeEvent(event)
+        # 窗口刚 expose 时触发重绘：paintGL 在未 expose 时直接返回且不排队
+        # 重试，本地文件起播快（无网络延迟），首帧可能在 expose 前就已送达
+        # 并丢弃；expose 后若无任何事件触发 paintGL，画面一直黑到退出重进。
+        # expose 变化时显式 update，确保 paintGL 跑起来建上下文并渲染。
+        if self.isExposed():
+            self.update()
 
 
 class MpvWidget(_MpvWidgetBase):
@@ -1258,6 +1278,33 @@ class MpvWidget(_MpvWidgetBase):
             has_video_track = any(isinstance(track, dict) and track.get("type") == "video" for track in normalized)
             if has_video_track:
                 self._audio_cover_active = False
+                # 首播本地黑屏根因：vid=auto 时 mpv 没选上视频轨（vcodec=None），
+                # 渲染调成功但无帧可画。检测到视频轨却没在解码时，强制选中首个视频轨。
+                try:
+                    _player = self._player
+                    _vcodec = None
+                    try:
+                        _vcodec = _player["video-codec"] if _player is not None else None
+                    except Exception:
+                        pass
+                    if _vcodec is None and _player is not None:
+                        _vid_id = None
+                        for _t in normalized:
+                            if isinstance(_t, dict) and _t.get("type") == "video" and _t.get("id") is not None:
+                                _vid_id = _t["id"]
+                                break
+                        if _vid_id is not None:
+                            def _force_vid() -> None:
+                                try:
+                                    _player["vid"] = _vid_id
+                                except Exception:
+                                    pass
+                            if self._on_widget_thread():
+                                _force_vid()
+                            else:
+                                self._post_to_widget_thread(_force_vid)
+                except Exception:
+                    pass
                 return
             if self._audio_cover_active:
                 self._set_video_picture_state("audio-cover")
