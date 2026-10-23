@@ -8,8 +8,9 @@ git apply ~/atv-player-patches/atv-context-menu-click-fix.patch
 cp ~/atv-player-patches/mpv_widget.py src/atv_player/player/mpv_widget.py
 git apply ~/atv-player-patches/atv-iso-on-render-fix-v2.patch
 git apply ~/atv-player-patches/atv-external-subtitle-v7.patch
-git status --short
+git apply ~/atv-player-patches/atv-external-subtitle-url-probe.patch
+git apply ~/atv-player-patches/atv-external-subtitle-url-probe-delay.patch
 uv run python ~/atv-player-patches/standalone_player_atv_v2.py
 
 
-bash ~/atv-player-patches/build-player-app.sh
+bash ~/atv-player-patches/build-player-app-full.sh
