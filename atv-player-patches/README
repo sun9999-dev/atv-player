@@ -10,6 +10,7 @@ git apply ~/atv-player-patches/atv-iso-on-render-fix-v2.patch
 git apply ~/atv-player-patches/atv-external-subtitle-v7.patch
 git apply ~/atv-player-patches/atv-external-subtitle-url-probe.patch
 git apply ~/atv-player-patches/atv-external-subtitle-url-probe-delay.patch
+git apply ~/atv-player-patches/atv-external-subtitle-url-probe-fix.patch
 uv run python ~/atv-player-patches/standalone_player_atv_v2.py
 
 
