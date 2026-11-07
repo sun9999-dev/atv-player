@@ -1,7 +1,10 @@
 #!/bin/bash
 # ATVPlayer.app（完整版）：PyInstaller 把 Python + 依赖 + libmpv + 已打补丁源码全打进 .app。
 # 用法：bash ~/atv-player-patches/build-player-app-full.sh [输出目录，默认 /Applications]
-# 要求：~/src/atv-player 已打好补丁（v8 除 mpv_widget + 字幕关闭 + 菜单手感 + 渲染文件覆盖 + ISO-on-render v2）。
+# 要求：~/src/atv-player 已打好补丁，顺序与 2026-11-07 源码运行验证过的一致：
+#   v8 除 mpv_widget + 字幕关闭 + 菜单点击 + 渲染文件覆盖(mpv_widget.py) + ISO-on-render v2
+#   + 外挂字幕 v7 + url-probe + url-probe-delay + url-probe-fix（远端同名字幕 JSON 误判修复）。
+#   只打 Intel 版（Mac 上跑，~/mpv-dist/lib 里是 Intel libmpv）。
 set -euo pipefail
 OUT_DIR="${1:-/Applications}"
 SRC="${SRC:-$HOME/src/atv-player}"
@@ -13,6 +16,7 @@ APP_NAME="ATVPlayer"
 # 1. 校验源码已打补丁
 grep -q "set_iso_track_languages" "$SRC/src/atv_player/player/mpv_widget.py" || { echo "错误：mpv_widget.py 缺 ISO 语言修复（先按复原测试流程打补丁）"; exit 1; }
 grep -q "track_id" "$SRC/src/atv_player/ui/player_window.py" || { echo "错误：player_window.py 缺偏好 id 修复"; exit 1; }
+grep -q "_looks_like_subtitle_text" "$SRC/src/atv_player/ui/player_window.py" || { echo "错误：player_window.py 缺 url-probe-fix（远端同名字幕 JSON 误判修复，先打 atv-external-subtitle-url-probe-fix.patch）"; exit 1; }
 [ -f "$MPV_LIB/libmpv.2.dylib" ] || { echo "错误：缺少 $MPV_LIB/libmpv.2.dylib"; exit 1; }
 
 # 2. 准备工作目录
