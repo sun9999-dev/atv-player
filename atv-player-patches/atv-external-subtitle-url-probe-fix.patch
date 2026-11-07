@@ -1,0 +1,74 @@
+diff --git a/src/atv_player/ui/player_window.py b/src/atv_player/ui/player_window.py
+index 013411d..21bbbd1 100644
+--- a/src/atv_player/ui/player_window.py
++++ b/src/atv_player/ui/player_window.py
+@@ -10184,17 +10184,38 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             return value
+         return None
+ 
+-    def _remote_subtitle_exists(self, url: str, headers: dict) -> bool:
+-        """远端字幕是否存在：先 HEAD，HEAD 不可用/被拒时用流式 GET 只看状态码（不对付 HEAD 畸形的服务器）。"""
+-        try:
+-            response = httpx.head(url, headers=headers, timeout=10.0, follow_redirects=True)
+-            if response.status_code in (200, 206):
++    @staticmethod
++    def _looks_like_subtitle_text(text: str) -> bool:
++        """正文是否像字幕：拒绝 JSON 错误体 / HTML 页（alist 对无签名字幕回 HTTP 200 + {"code":401,...}，
++        只看状态码会被骗）。合法字幕开头不可能是 JSON 错误体或 HTML：SRT 以数字开头，ASS/SSA 以 [Script Info] 开头，
++        VTT 以 WEBVTT 开头，TTML/SMI 以 <tt>/<SAMI> 开头；MicroDVD .sub 的 {0}{100} 不是合法 JSON，不会误杀。"""
++        stripped = text.lstrip("\ufeff \t\r\n")
++        if not stripped:
++            return False
++        lowered = stripped.lower()
++        if lowered.startswith("<!doctype") or lowered.startswith("<html"):
++            return False
++        if stripped.startswith("{"):
++            try:
++                obj = json.loads(stripped[:2048])
++            except Exception:
+                 return True
+-        except Exception:
+-            pass
++            if isinstance(obj, dict) and ("code" in obj or "message" in obj):
++                return False
++        return True
++
++    def _remote_subtitle_exists(self, url: str, headers: dict) -> bool:
++        """远端字幕是否存在：不用 HEAD（该 alist 对无签名字幕 HEAD 也回 200，无正文可验），
++        改用流式 GET 只读开头 1KB：状态 200/206 且正文像字幕才算存在。"""
+         try:
+             with httpx.stream("GET", url, headers=headers, timeout=10.0, follow_redirects=True) as response:
+-                return response.status_code in (200, 206)
++                if response.status_code not in (200, 206):
++                    return False
++                try:
++                    first = next(response.iter_bytes(1024), b"")
++                except Exception:
++                    return False
++                return self._looks_like_subtitle_text(first.decode("utf-8", errors="ignore"))
+         except Exception:
+             return False
+ 
+@@ -10331,9 +10352,9 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+                 ]
+             except Exception:
+                 current_item.external_subtitles = [option]
+-            self._append_log(f"已加载外挂字幕（远端同名）：{filename}")
++            self._append_log(f"已找到远端同名字幕，正在加载：{filename}")
+         else:
+-            self._append_log(f"同名字幕已挂载：{filename}")
++            self._append_log(f"远端同名字幕已在列表中，正在加载：{filename}")
+         try:
+             self._refresh_subtitle_state()
+         except Exception:
+@@ -13246,6 +13267,10 @@ class PlayerWindow(ThemedWidgetWindowBase, AsyncGuardMixin):
+             if "tlang=" in subtitle.url:
+                 raise ValueError("YouTube 翻译字幕被 Google 拦截，当前无法直接加载")
+             raise ValueError("YouTube 字幕请求返回了网页而不是字幕内容")
++        # 通用：远端取到的若是 JSON 错误体 / HTML 页（alist 无签名回 HTTP 200 + {"code":401,...}），
++        # 不是字幕内容，在这里拦下，别写进临时文件交给 mpv（否则 sub-add 报 -12「字幕切换失败」）。
++        if not self._looks_like_subtitle_text(text):
++            raise ValueError("远端字幕返回的不是字幕内容")
+ 
+     def _set_subtitle_position_from_menu(self, value: int, secondary: bool) -> None:
+         clamped = max(0, min(int(value), 100))
