@@ -1,0 +1,50 @@
+diff --git a/src/atv_player/ui/theme.py b/src/atv_player/ui/theme.py
+index eddb4ca..6092e52 100644
+--- a/src/atv_player/ui/theme.py
++++ b/src/atv_player/ui/theme.py
+@@ -28,6 +28,45 @@ class FlatComboBox(QComboBox):
+             hint.setHeight(desired_height)
+         return hint
+ 
++    def showPopup(self) -> None:
++        # Windows 上弹出列表宽度跟随下拉框本身（框被 maximumWidth 压到 ~74px），
++        # 长条目会被截成 "繁...]"；macOS 会自动按最长条目撑开。
++        # 弹出前按最长条目文本量一下宽度，只放宽弹出层，不动框本身。
++        width = self._popup_fit_width()
++        if width > 0:
++            self.view().setMinimumWidth(width)
++        super().showPopup()
++        if width > 0:
++            # 兜底：若平台仍按框宽排弹出层，弹出后再把弹出窗口拉宽并夹回屏幕内。
++            try:
++                popup = self.view().window()
++                if popup is not None and popup.width() < width:
++                    popup.resize(width, popup.height())
++                    screen = popup.screen()
++                    if screen is not None:
++                        area = screen.availableGeometry()
++                        if popup.x() + width > area.right():
++                            popup.move(max(area.left(), area.right() - width), popup.y())
++            except Exception:
++                pass
++
++    def _popup_fit_width(self) -> int:
++        try:
++            view = self.view()
++            metrics = view.fontMetrics()
++            widest = 0
++            for index in range(self.count()):
++                widest = max(widest, metrics.horizontalAdvance(self.itemText(index)))
++            if widest <= 0:
++                return 0
++            width = widest + 28  # 条目左右内边距 + 图标/边框余量
++            if self.count() > self.maxVisibleItems():
++                width += view.verticalScrollBar().sizeHint().width()
++            width = max(width, self.width())
++            return min(width, 360)
++        except Exception:
++            return 0
++
+     def paintEvent(self, _event) -> None:
+         painter = QPainter(self)
+         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
