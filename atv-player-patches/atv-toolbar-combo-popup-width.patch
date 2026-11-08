@@ -1,8 +1,8 @@
 diff --git a/src/atv_player/ui/theme.py b/src/atv_player/ui/theme.py
-index eddb4ca..b01cac5 100644
+index eddb4ca..29393fa 100644
 --- a/src/atv_player/ui/theme.py
 +++ b/src/atv_player/ui/theme.py
-@@ -28,6 +28,55 @@ class FlatComboBox(QComboBox):
+@@ -28,6 +28,112 @@ class FlatComboBox(QComboBox):
              hint.setHeight(desired_height)
          return hint
  
@@ -13,30 +13,87 @@ index eddb4ca..b01cac5 100644
 +        width = self._popup_fit_width()
 +        if width > 0:
 +            self.view().setMinimumWidth(width)
++        # 弹出前记一下列表的完整高度：macOS 上往下掉时 Qt 会先把高度截到只剩框下方那点空间
++        # （只剩 2 条），截完后“底部没出屏幕”，只看底部就发现不了问题，要拿完整高度来比。
++        full_height = self._popup_full_height()
 +        super().showPopup()
-+        # 弹出后再夹一次位置：有的平台仍按框宽排弹出层（窄了要拉宽），
-+        # 下拉框在窗口底部时弹出层会掉到屏幕外被截断（要翻到框上方，像 Windows 那样向上弹）。
++        self._fix_popup_geometry(full_height, width)
++
++    def _fix_popup_geometry(self, full_height: int, width: int) -> None:
++        # 弹出后再夹一次位置：有的平台仍按框宽排弹出层（窄了要拉宽）。
++        # 工具栏的框都在窗口下半部（字幕 12 条、倍速 6 条都一样）：不管 Qt 怎么摆，
++        # 每次都直接把弹出层放到框上方，底边贴着框顶——第一次点和第二次点结果一样，
++        # 不依赖 Qt 的落点，窗口怎么变都跟框走。
++        # 对话框里框在窗口上半部、向下弹正常的，不动；掉下去且被截/伸出窗口时才翻上去。
 +        try:
 +            popup = self.view().window()
 +            if popup is None:
 +                return
++            screen = popup.screen()
++            area = screen.availableGeometry() if screen is not None else None
++            combo_top = self.mapToGlobal(QPoint(0, 0)).y()
 +            if width > 0 and popup.width() < width:
 +                popup.resize(width, popup.height())
-+            screen = popup.screen()
-+            if screen is None:
++            win = self.window()
++            win_top = win_bottom = None
++            if win is not None:
++                try:
++                    win_top = win.mapToGlobal(QPoint(0, 0)).y()
++                    win_bottom = win.mapToGlobal(QPoint(0, win.height())).y()
++                except Exception:
++                    win_top = win_bottom = None
++            in_lower_half = False
++            if win_top is not None and win_bottom is not None:
++                combo_center = combo_top + self.height() // 2
++                in_lower_half = combo_center >= (win_top + win_bottom) // 2
++            if area is not None and in_lower_half:
++                h = min(full_height, combo_top - area.top())
++                if h <= 0:
++                    h = popup.height()
++                popup.resize(popup.width(), h)
++                popup.move(popup.x(), combo_top - h)
++                if popup.x() + popup.width() > area.right():
++                    popup.move(max(area.left(), area.right() - popup.width()), popup.y())
 +                return
-+            area = screen.availableGeometry()
-+            x, y = popup.x(), popup.y()
-+            if x + popup.width() > area.right():
-+                x = max(area.left(), area.right() - popup.width())
-+            if y + popup.height() > area.bottom():
-+                y = self.mapToGlobal(QPoint(0, 0)).y() - popup.height()
-+                if y < area.top():
-+                    y = area.top()
-+            if x != popup.x() or y != popup.y():
-+                popup.move(x, y)
++            dropped = popup.y() > combo_top
++            capped = full_height > 0 and popup.height() < full_height - 4
++            below_window = (
++                win_bottom is not None and popup.geometry().bottom() > win_bottom
++            )
++            if area is not None and dropped and (capped or below_window):
++                h = min(full_height, combo_top - area.top())
++                if h <= 0:
++                    h = popup.height()
++                popup.resize(popup.width(), h)
++                popup.move(popup.x(), combo_top - h)
++                if popup.x() + popup.width() > area.right():
++                    popup.move(max(area.left(), area.right() - popup.width()), popup.y())
++            elif area is not None:
++                x, y = popup.x(), popup.y()
++                if x + popup.width() > area.right():
++                    x = max(area.left(), area.right() - popup.width())
++                if y + popup.height() > area.bottom():
++                    y = combo_top - popup.height()
++                    if y < area.top():
++                        y = area.top()
++                if x != popup.x() or y != popup.y():
++                    popup.move(x, y)
 +        except Exception:
 +            pass
++
++    def _popup_full_height(self) -> int:
++        # 弹出层完整高度（最多 maxVisibleItems 行）。view.sizeHint().height() 是内容高，
++        # 不含弹出层边框；按行高算更接近弹出层实际高度。
++        try:
++            rows = min(self.count(), self.maxVisibleItems())
++            if rows <= 0:
++                return 0
++            row_h = self.view().sizeHintForRow(0)
++            if row_h > 0:
++                return rows * row_h
++            return self.view().sizeHint().height()
++        except Exception:
++            return 0
 +
 +    def _popup_fit_width(self) -> int:
 +        try:
