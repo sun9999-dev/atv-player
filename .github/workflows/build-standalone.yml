@@ -78,7 +78,15 @@ jobs:
           cp "$P/mpv_widget.py" src/atv_player/player/mpv_widget.py
           git apply "$P/atv-iso-on-render-fix-v2.patch"
           git apply "$P/atv-external-subtitle-v7.patch"
+          git apply "$P/atv-external-subtitle-url-probe.patch"
+          git apply "$P/atv-external-subtitle-url-probe-delay.patch"
+          git apply "$P/atv-external-subtitle-url-probe-fix.patch"
+          git apply "$P/atv-toolbar-combo-popup-width.patch"
           grep -q "_open_external_subtitle" src/atv_player/ui/player_window.py || { echo "错误：外挂字幕 v7 没打上"; exit 1; }
+          grep -q "_probe_remote_same_name_subtitle" src/atv_player/ui/player_window.py || { echo "错误：远端同名探测没打上"; exit 1; }
+          grep -q "_delayed_probe" src/atv_player/ui/player_window.py || { echo "错误：远端探测延迟没打上"; exit 1; }
+          grep -q "_looks_like_subtitle_text" src/atv_player/ui/player_window.py || { echo "错误：远端探测内容校验没打上"; exit 1; }
+          grep -q "_popup_fit_width" src/atv_player/ui/theme.py || { echo "错误：工具栏下拉框弹出宽度没打上"; exit 1; }
           git status --short
 
       - name: Build (PyInstaller, .app)
